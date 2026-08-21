@@ -84,6 +84,7 @@ const buildSession = (data) => ({
   refreshToken: data.refresh_token,
   expiresAt: Date.now() + (data.expires_in || 3600) * 1000,
   email: data.user?.email,
+  userId: data.user?.id,
 });
 
 /** Llamada cruda a la API REST (PostgREST) de una tabla, ya autenticada. */
@@ -124,6 +125,53 @@ async function deleteRow(table, id, accessToken) {
   const r = await sbFetch(`/rest/v1/${table}?id=eq.${id}`, { method: "DELETE", accessToken, prefer: "return=minimal" });
   if (!r.ok) return r;
   return { ok: true };
+}
+
+/* ---------- Supabase Storage (adjuntos) — también REST directo ---------- */
+async function uploadFile(path, file, accessToken) {
+  try {
+    const res = await fetch(`${SUPABASE_URL}/storage/v1/object/adjuntos/${path}`, {
+      method: "POST",
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": file.type || "application/octet-stream",
+      },
+      body: file,
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok) return { ok: false, error: data?.message || data?.error || `Error ${res.status}` };
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e?.message || "No se pudo subir el archivo." };
+  }
+}
+
+async function getSignedUrl(path, accessToken, expiresIn = 3600) {
+  try {
+    const res = await fetch(`${SUPABASE_URL}/storage/v1/object/sign/adjuntos/${path}`, {
+      method: "POST",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ expiresIn }),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data?.signedURL) return null;
+    return `${SUPABASE_URL}/storage/v1${data.signedURL}`;
+  } catch {
+    return null;
+  }
+}
+
+async function deleteFile(path, accessToken) {
+  try {
+    const res = await fetch(`${SUPABASE_URL}/storage/v1/object/adjuntos/${path}`, {
+      method: "DELETE",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${accessToken}` },
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
 }
 
 /* ---------- Motor de prioridad (reglas, no IA) ---------- */
@@ -264,6 +312,9 @@ export default function CaroControl() {
   const [agenda, setAgenda] = useState([]);
   const [notas, setNotas] = useState([]);
   const [documentos, setDocumentos] = useState([]);
+  const [archivos, setArchivos] = useState([]);
+  const [perfil, setPerfil] = useState(null); // { id, preferencias } o null si aún no se ha creado
+  const [mensajes, setMensajes] = useState([]); // chat de aclaración de cada nota
   const [modal, setModal] = useState(null); // {type, data?}
   const [search, setSearch] = useState("");
   const [saving, setSaving] = useState(false);
@@ -304,9 +355,10 @@ export default function CaroControl() {
       setLoading(true);
       const token = await getValidToken();
       if (!token) { setLoading(false); return; }
-      const [c, t, co, ag, no, doc] = await Promise.all([
+      const [c, t, co, ag, no, doc, arch, perf, msg] = await Promise.all([
         fetchTable("clientes", token), fetchTable("tareas", token), fetchTable("cobros", token),
         fetchTable("agenda", token), fetchTable("notas_rapidas", token), fetchTable("documentos_pendientes", token),
+        fetchTable("archivos", token), fetchTable("perfil", token), fetchTable("mensajes_nota", token),
       ]);
       let hadError = false;
       if (c.ok) setClientes(c.data); else { hadError = true; }
@@ -315,6 +367,9 @@ export default function CaroControl() {
       if (ag.ok) setAgenda(ag.data); else { hadError = true; }
       if (no.ok) setNotas(no.data); else { hadError = true; }
       if (doc.ok) setDocumentos(doc.data); else { hadError = true; }
+      if (arch.ok) setArchivos(arch.data); else { hadError = true; }
+      if (perf.ok) setPerfil(perf.data[0] || null); else { hadError = true; }
+      if (msg.ok) setMensajes(msg.data); else { hadError = true; }
       setLoading(false);
       if (hadError) showToast("error", "Algunos datos no se pudieron cargar desde Supabase. Revisa tu conexión.");
     })();
@@ -359,6 +414,66 @@ export default function CaroControl() {
 
   const save = (table, list, setter) => (item, isEdit) =>
     isEdit ? updateItem(table, item.id, item, setter, list) : createItem(table, item, setter, list);
+
+  /** Sube un archivo al storage privado y registra su fila en `archivos`.
+   * Si falla la subida, no se crea ningún registro huérfano. */
+  const subirArchivo = useCallback(async (file, { notaId = null, tareaId = null, clienteId = null } = {}) => {
+    const token = await getValidToken();
+    if (!token || !session?.userId) { showToast("error", "Tu sesión expiró. Vuelve a iniciar sesión."); return false; }
+    const nombreSeguro = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const ruta = `${session.userId}/${notaId || "general"}/${uid()}-${nombreSeguro}`;
+    setSaving(true);
+    const up = await uploadFile(ruta, file, token);
+    if (!up.ok) {
+      setSaving(false);
+      showToast("error", `No se pudo subir "${file.name}": ${up.error}`);
+      return false;
+    }
+    const ok = await createItem("archivos", {
+      id: uid(), notaId, tareaId, clienteId,
+      nombreArchivo: file.name, rutaStorage: ruta, tipoMime: file.type, tamanoBytes: file.size,
+    }, setArchivos, archivos);
+    setSaving(false);
+    return ok;
+  }, [getValidToken, session, showToast, createItem, archivos]);
+
+  const eliminarArchivo = useCallback(async (archivo) => {
+    const token = await getValidToken();
+    if (!token) return false;
+    setSaving(true);
+    await deleteFile(archivo.rutaStorage, token);
+    const ok = await deleteItem("archivos", archivo.id, setArchivos, archivos);
+    setSaving(false);
+    return ok;
+  }, [getValidToken, archivos, deleteItem]);
+
+  const verArchivo = useCallback(async (archivo) => {
+    const token = await getValidToken();
+    if (!token) return;
+    const url = await getSignedUrl(archivo.rutaStorage, token);
+    if (url) window.open(url, "_blank");
+    else showToast("error", "No se pudo generar el enlace para ver el archivo.");
+  }, [getValidToken, showToast]);
+
+  /** Crea el perfil la primera vez, o lo actualiza si ya existe. Una sola fila por usuaria. */
+  const guardarPerfil = useCallback(async (texto) => {
+    if (perfil?.id) {
+      const ok = await updateItem("perfil", perfil.id, { preferencias: texto }, setPerfil0, [perfil]);
+      return ok;
+    }
+    const nuevoId = uid();
+    const ok = await createItem("perfil", { id: nuevoId, preferencias: texto }, setPerfil0, []);
+    return ok;
+  }, [perfil, updateItem, createItem]);
+
+  // createItem/updateItem esperan un setter de array; el perfil es una sola fila,
+  // así que lo adaptamos aquí sin tocar la forma general de esas funciones.
+  function setPerfil0(updater) {
+    setPerfil((prev) => {
+      const arr = updater(prev ? [prev] : []);
+      return arr[0] || null;
+    });
+  }
 
   const clienteNombre = (id) => clientes.find((c) => c.id === id)?.nombre || null;
 
@@ -467,7 +582,7 @@ export default function CaroControl() {
             {saving && (<><Loader2 size={13} className="animate-spin" /> <span className="hidden sm:inline">Guardando…</span></>)}
           </div>
           <button
-            onClick={() => { setSession(null); setClientes([]); setTareas([]); setCobros([]); setAgenda([]); setNotas([]); setDocumentos([]); }}
+            onClick={() => { setSession(null); setClientes([]); setTareas([]); setCobros([]); setAgenda([]); setNotas([]); setDocumentos([]); setArchivos([]); setPerfil(null); setMensajes([]); }}
             className="hidden sm:inline text-xs font-medium px-2 py-1 rounded-md"
             style={{ color: "#8A8398" }}
             title={session.email}
@@ -554,10 +669,18 @@ export default function CaroControl() {
                 clientes={clientes}
                 tareas={tareas}
                 documentos={documentos}
+                archivos={archivos}
+                perfil={perfil}
+                guardarPerfil={guardarPerfil}
+                mensajes={mensajes}
+                setMensajes={setMensajes}
                 clienteNombre={clienteNombre}
                 createItem={createItem}
                 updateItem={updateItem}
                 deleteItem={deleteItem}
+                subirArchivo={subirArchivo}
+                eliminarArchivo={eliminarArchivo}
+                verArchivo={verArchivo}
                 setClientes={setClientes}
                 setTareas={setTareas}
                 setCobros={setCobros}
@@ -1135,19 +1258,30 @@ function CobroModal({ data, clientes, onClose, onSave, onDelete }) {
    ============================================================ */
 
 function AgendaView({ agenda, clienteNombre, onNuevo, onEditar }) {
-  const ordenada = [...agenda].sort((a, b) => (a.fecha || "").localeCompare(b.fecha || ""));
+  const [filtro, setFiltro] = useState("TODO");
+  const hoyISO = todayISO();
+  const base = filtro === "TODO" ? agenda
+    : filtro === "HOY" ? agenda.filter((a) => a.fecha === hoyISO)
+    : filtro === "LABORAL" ? agenda.filter((a) => a.area === "Profesional")
+    : agenda.filter((a) => a.area === "Personal" || a.area === "Familia/Samuel");
+  const ordenada = [...base].sort((a, b) => (a.fecha || "").localeCompare(b.fecha || ""));
   return (
     <div>
       <div className="flex items-center justify-between mb-4">
-        <SectionTitle sub={`${agenda.length} eventos`}>Agenda</SectionTitle>
+        <SectionTitle sub={`${ordenada.length} de ${agenda.length} eventos`}>Agenda</SectionTitle>
         <button onClick={onNuevo} className="flex items-center gap-1.5 text-sm font-medium px-3.5 py-2 rounded-lg text-white" style={{ background: "#7A2E4A" }}>
           <Plus size={15} /> Nuevo
         </button>
       </div>
+      <div className="flex gap-2 overflow-x-auto pb-3 mb-1 -mx-1 px-1">
+        {[["TODO", "Todo"], ["HOY", "Caro Hoy"], ["LABORAL", "Caro Laboral"], ["PERSONAL", "Caro Personal"]].map(([k, label]) => (
+          <FilterChip key={k} active={filtro === k} onClick={() => setFiltro(k)}>{label}</FilterChip>
+        ))}
+      </div>
       {ordenada.length === 0 ? (
-        <EmptyState icon={CalendarDays} text="No hay eventos programados." />
+        <EmptyState icon={CalendarDays} text="No hay eventos en esta vista." />
       ) : (
-        <div className="space-y-2">
+        <div className="space-y-2 mt-3">
           {ordenada.map((a) => (
             <button key={a.id} onClick={() => onEditar(a)} className="w-full text-left">
               <Card className="px-4 py-3 flex items-center gap-3 hover:border-[#7A2E4A] transition-colors">
@@ -1235,12 +1369,162 @@ function resumenAccion(item) {
   return `${ENTIDAD_LABEL[entidad] || entidad} ${verbo.toLowerCase()}: ${nombre}${extra}`;
 }
 
-function NotaRapidaView({ notas, clientes, tareas, documentos, clienteNombre, createItem, updateItem, deleteItem, setClientes, setTareas, setCobros, setAgenda, setNotas, setDocumentos }) {
+const fmtBytes = (n) => {
+  if (!n) return "";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+};
+
+const ESTADO_NOTA_META = {
+  Nueva: { label: "Nueva", color: "#8A8398" },
+  "Necesita aclaración": { label: "💬 Necesita aclaración", color: "#8B2E3F" },
+  Completada: { label: "Completada", color: "#4B7B62" },
+  Archivada: { label: "Archivada", color: "#B0A99A" },
+};
+
+function PreferenciasPanel({ perfil, guardarPerfil }) {
+  const [abierto, setAbierto] = useState(false);
+  const [texto, setTexto] = useState(perfil?.preferencias || "");
+  const [guardando, setGuardando] = useState(false);
+  const [guardadoOk, setGuardadoOk] = useState(false);
+
+  useEffect(() => { setTexto(perfil?.preferencias || ""); }, [perfil?.preferencias]);
+
+  const guardar = async () => {
+    setGuardando(true); setGuardadoOk(false);
+    const ok = await guardarPerfil(texto);
+    setGuardando(false);
+    if (ok) { setGuardadoOk(true); setTimeout(() => setGuardadoOk(false), 2000); }
+  };
+
+  return (
+    <Card className="p-4 mb-6">
+      <button onClick={() => setAbierto(!abierto)} className="w-full flex items-center justify-between text-left">
+        <span className="text-sm font-semibold" style={{ color: "#2B2440" }}>Cómo trabajo — mis preferencias</span>
+        <ChevronDown size={16} style={{ color: "#8A8398", transform: abierto ? "rotate(180deg)" : "none", transition: "transform 0.15s" }} />
+      </button>
+      {!abierto && (
+        <p className="text-xs mt-1" style={{ color: "#8A8398" }}>
+          {perfil?.preferencias ? "Ya tienes preferencias guardadas — ábrelo para editarlas." : "Cuéntame cómo trabajas para que haga menos preguntas: apodos de clientes, actividades habituales como \"natación\", prioridades por defecto."}
+        </p>
+      )}
+      {abierto && (
+        <div className="mt-3">
+          <ul className="text-xs mb-3 space-y-1 pl-4" style={{ color: "#8A8398", listStyle: "disc" }}>
+            <li>Actividades habituales (ej. "Natación: personal, sábados 7:30am")</li>
+            <li>Apodos de clientes (ej. "a Pity me refiero a Patricia Gómez")</li>
+            <li>Prioridad por defecto según tipo de trabajo</li>
+            <li>Cómo interpretar plazos vagos ("esta semana" = viernes)</li>
+            <li>Tu tolerancia a que decida sin preguntar tanto</li>
+          </ul>
+          <textarea
+            value={texto}
+            onChange={(e) => setTexto(e.target.value)}
+            rows={6}
+            placeholder="Ej. Natación: actividad personal, sábados 7:30am. Mis clientes prioritarios son XYZ y ABC. A 'Pity' me refiero a mi cliente Patricia Gómez..."
+            className={inputCls}
+            style={inputStyle}
+          />
+          <div className="flex items-center gap-2 mt-2">
+            <button onClick={guardar} disabled={guardando} className="flex items-center gap-1.5 text-sm font-medium px-3.5 py-2 rounded-lg text-white disabled:opacity-40" style={{ background: "#7A2E4A" }}>
+              {guardando && <Loader2 size={13} className="animate-spin" />}
+              Guardar preferencias
+            </button>
+            {guardadoOk && <span className="text-xs flex items-center gap-1" style={{ color: "#4B7B62" }}><Check size={13} /> Guardado</span>}
+          </div>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+/** Una tarjeta por nota. Si la nota necesita aclaración, muestra su chat propio
+ * justo ahí — nunca crea una nota nueva para la pregunta ni para la respuesta. */
+function NotaCard({ nota, mensajesDeNota, adjuntosDeNota, onResponder, onMarcarProcesada, onArchivar, onEliminar, onVerArchivo, onEliminarArchivo }) {
+  const [respuesta, setRespuesta] = useState("");
+  const [enviando, setEnviando] = useState(false);
+  const meta = ESTADO_NOTA_META[nota.estado] || ESTADO_NOTA_META.Nueva;
+
+  const enviarRespuesta = async () => {
+    if (!respuesta.trim() || enviando) return;
+    setEnviando(true);
+    await onResponder(nota.id, respuesta.trim());
+    setRespuesta("");
+    setEnviando(false);
+  };
+
+  return (
+    <Card className="p-4">
+      <p className="text-sm" style={{ color: "#2B2440" }}>{nota.texto}</p>
+      {nota.resumen && <p className="text-xs mt-1.5" style={{ color: "#8A8398" }}>{nota.resumen}</p>}
+
+      {adjuntosDeNota.length > 0 && (
+        <div className="flex flex-wrap gap-1.5 mt-2">
+          {adjuntosDeNota.map((a) => (
+            <span key={a.id} className="inline-flex items-center gap-1 pl-2 pr-1 py-1 rounded-md text-xs" style={{ background: "#F5F1EE", color: "#6B6570" }}>
+              <button onClick={() => onVerArchivo(a)} className="hover:underline">{a.nombreArchivo}</button>
+              <button onClick={() => onEliminarArchivo(a)} className="p-0.5 rounded-full hover:bg-white"><X size={10} /></button>
+            </span>
+          ))}
+        </div>
+      )}
+
+      {nota.estado === "Necesita aclaración" && (
+        <div className="mt-3 pt-3 border-t" style={{ borderColor: "#E7E1D8" }}>
+          <div className="space-y-2 mb-2">
+            {mensajesDeNota.map((m) => (
+              <div key={m.id} className={`text-sm px-3 py-2 rounded-lg max-w-[85%] ${m.rol === "carolina" ? "ml-auto" : ""}`}
+                style={{ background: m.rol === "carolina" ? "#7A2E4A" : "#F5F1EE", color: m.rol === "carolina" ? "white" : "#2B2440" }}>
+                {m.contenido}
+              </div>
+            ))}
+          </div>
+          <div className="flex items-center gap-2">
+            <input
+              value={respuesta}
+              onChange={(e) => setRespuesta(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") enviarRespuesta(); }}
+              placeholder="Tu respuesta…"
+              className={inputCls}
+              style={inputStyle}
+            />
+            <button
+              onClick={enviarRespuesta}
+              disabled={!respuesta.trim() || enviando}
+              className="flex-shrink-0 flex items-center gap-1 text-xs font-medium px-3 py-2 rounded-lg text-white disabled:opacity-40"
+              style={{ background: "#7A2E4A" }}
+            >
+              {enviando && <Loader2 size={12} className="animate-spin" />}
+              Responder
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="flex items-center justify-between mt-3">
+        <span className="text-[11px]" style={{ color: "#B0A99A" }}>
+          {new Date(nota.createdAt).toLocaleString("es-CO", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}
+        </span>
+        <div className="flex items-center gap-3">
+          <Stamp color={meta.color}>{meta.label}</Stamp>
+          {nota.estado !== "Archivada" && (
+            <button onClick={() => onArchivar(nota.id)} className="text-xs font-medium" style={{ color: "#8A8398" }}>Archivar</button>
+          )}
+          <button onClick={() => onEliminar(nota.id)}><Trash2 size={13} style={{ color: "#B0A99A" }} /></button>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+function NotaRapidaView({ notas, clientes, tareas, documentos, archivos, mensajes, setMensajes, perfil, guardarPerfil, clienteNombre, createItem, updateItem, deleteItem, subirArchivo, eliminarArchivo, verArchivo, setClientes, setTareas, setCobros, setAgenda, setNotas, setDocumentos }) {
   const [texto, setTexto] = useState("");
   const [copiado, setCopiado] = useState(false);
   const [procesando, setProcesando] = useState(false);
   const [errorIA, setErrorIA] = useState("");
-  const [resultado, setResultado] = useState(null); // { hechos: [], preguntas: [] }
+  const [archivosSeleccionados, setArchivosSeleccionados] = useState([]);
+  const fileInputRef = React.useRef(null);
 
   const copiarPrompt = () => {
     const promptCompleto = PROMPT_BASE + texto + '"';
@@ -1249,100 +1533,123 @@ function NotaRapidaView({ notas, clientes, tareas, documentos, clienteNombre, cr
     setTimeout(() => setCopiado(false), 1500);
   };
 
+  const agregarArchivos = (files) => setArchivosSeleccionados((prev) => [...prev, ...Array.from(files)]);
+  const quitarSeleccionado = (idx) => setArchivosSeleccionados((prev) => prev.filter((_, i) => i !== idx));
+  const subirSeleccionados = async (notaId) => {
+    for (const file of archivosSeleccionados) await subirArchivo(file, { notaId });
+    setArchivosSeleccionados([]);
+  };
+
+  const contextoActual = () => {
+    const tareasAbiertas = tareas
+      .filter((t) => !["Completada", "Cancelada"].includes(t.estado))
+      .map((t) => ({ id: t.id, titulo: t.titulo, clienteNombre: clienteNombre(t.clienteId) }));
+    const documentosPendientes = documentos
+      .filter((d) => d.estado !== "Revisado")
+      .map((d) => ({ id: d.id, nombre: d.nombreDocumento, estado: d.estado, clienteNombre: clienteNombre(d.clienteId) }));
+    return {
+      clientes: clientes.map((c) => ({ id: c.id, nombre: c.nombre })),
+      tareasAbiertas, documentosPendientes,
+      preferencias: perfil?.preferencias || "",
+    };
+  };
+
+  /** Ejecuta las acciones ya interpretadas. Devuelve los hechos realizados y,
+   * como mucho, UNA pregunta pendiente (el motor ya garantiza que no manda más de una). */
+  const ejecutarAcciones = async (acciones) => {
+    const hechos = [];
+    let pregunta = null;
+    const clientesNuevos = {};
+
+    for (const item of acciones) {
+      if (item.entidad === "pendiente_aclarar") {
+        if (item.pregunta && !pregunta) pregunta = item.pregunta;
+        continue;
+      }
+
+      let clienteId = null;
+      if (item.clienteNombre) {
+        const key = item.clienteNombre.toLowerCase();
+        const existente = clientes.find((c) => c.nombre.toLowerCase() === key);
+        if (existente) clienteId = existente.id;
+        else if (clientesNuevos[key]) clienteId = clientesNuevos[key];
+        else {
+          const nuevoId = uid();
+          const ok = await createItem("clientes", { id: nuevoId, nombre: item.clienteNombre }, setClientes, clientes);
+          if (ok) { clienteId = nuevoId; clientesNuevos[key] = nuevoId; hechos.push(`Cliente nuevo: ${item.clienteNombre}`); }
+        }
+      }
+
+      const campos = { ...item.campos };
+
+      if (item.entidad === "tarea") {
+        if (item.accion === "actualizar" && item.targetId) {
+          const ok = await updateItem("tareas", item.targetId, campos, setTareas, tareas);
+          if (ok) hechos.push(resumenAccion(item));
+        } else {
+          const ok = await createItem("tareas", { id: uid(), estado: "Pendiente", area: "Profesional", prioridad: "Media", clienteId, ...campos }, setTareas, tareas);
+          if (ok) hechos.push(resumenAccion(item));
+        }
+      } else if (item.entidad === "cobro") {
+        const ok = await createItem("cobros", { id: uid(), estado: "Pendiente", clienteId, ...campos }, setCobros, []);
+        if (ok) hechos.push(resumenAccion(item));
+      } else if (item.entidad === "agenda") {
+        const ok = await createItem("agenda", { id: uid(), tipo: "Reunión", area: "Profesional", clienteId, ...campos }, setAgenda, []);
+        if (ok) hechos.push(resumenAccion(item));
+      } else if (item.entidad === "documento") {
+        if (item.accion === "actualizar" && item.targetId) {
+          const ok = await updateItem("documentos_pendientes", item.targetId, campos, setDocumentos, documentos);
+          if (ok) hechos.push(resumenAccion(item));
+        } else {
+          const ok = await createItem("documentos_pendientes", { id: uid(), clienteId, estado: "Solicitado", ...campos }, setDocumentos, documentos);
+          if (ok) hechos.push(resumenAccion(item));
+        }
+      }
+    }
+    return { hechos, pregunta };
+  };
+
   const guardarSinProcesar = async () => {
-    if (!texto.trim()) return;
-    const ok = await createItem("notas_rapidas", { id: uid(), texto: texto.trim(), procesada: false }, setNotas, notas);
-    if (ok) setTexto("");
+    if (!texto.trim() && archivosSeleccionados.length === 0) return;
+    const notaId = uid();
+    const ok = await createItem("notas_rapidas", { id: notaId, texto: texto.trim() || "(solo adjuntos)", estado: "Nueva", procesada: false }, setNotas, notas);
+    if (ok) { await subirSeleccionados(notaId); setTexto(""); }
   };
 
   const enviar = async () => {
-    if (!texto.trim() || procesando) return;
+    if ((!texto.trim() && archivosSeleccionados.length === 0) || procesando) return;
     const textoNota = texto.trim();
-    setProcesando(true); setErrorIA(""); setResultado(null);
+    setProcesando(true); setErrorIA("");
 
-    // Paso 1: guardar la nota original de una vez — historial real, pase lo que pase después.
     const notaId = uid();
-    await createItem("notas_rapidas", { id: notaId, texto: textoNota, procesada: false }, setNotas, notas);
+    await createItem("notas_rapidas", { id: notaId, texto: textoNota || "(solo adjuntos)", estado: "Nueva", procesada: false }, setNotas, notas);
+    await subirSeleccionados(notaId);
+
+    if (!textoNota) {
+      await updateItem("notas_rapidas", notaId, { estado: "Completada" }, setNotas, notas);
+      setProcesando(false); setTexto("");
+      return;
+    }
 
     try {
-      const tareasAbiertas = tareas
-        .filter((t) => !["Completada", "Cancelada"].includes(t.estado))
-        .map((t) => ({ id: t.id, titulo: t.titulo, clienteNombre: clienteNombre(t.clienteId) }));
-      const documentosPendientes = documentos
-        .filter((d) => d.estado !== "Revisado")
-        .map((d) => ({ id: d.id, nombre: d.nombreDocumento, estado: d.estado, clienteNombre: clienteNombre(d.clienteId) }));
-
       const res = await fetch("/api/parse-nota", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          texto: textoNota,
-          contexto: { clientes: clientes.map((c) => ({ id: c.id, nombre: c.nombre })), tareasAbiertas, documentosPendientes },
-        }),
+        body: JSON.stringify({ texto: textoNota, contexto: contextoActual() }),
       });
       const data = await res.json();
       if (!res.ok) { setErrorIA(data?.error || "No se pudo procesar la nota."); return; }
 
-      const acciones = data.acciones || [];
-      const hechos = [];
-      const preguntas = [];
-      const clientesNuevos = {}; // nombre en minúscula -> id, para no crear el mismo cliente dos veces en la misma nota
+      const { hechos, pregunta } = await ejecutarAcciones(data.acciones || []);
+      const resumenTexto = hechos.join(" · ") || (pregunta ? "" : "Sin acciones detectadas.");
 
-      for (const item of acciones) {
-        if (item.entidad === "pendiente_aclarar") {
-          if (item.pregunta) preguntas.push(item.pregunta);
-          continue;
-        }
-
-        // Resolver cliente: usar el existente, el recién creado en esta misma nota, o crear uno mínimo.
-        let clienteId = null;
-        if (item.clienteNombre) {
-          const key = item.clienteNombre.toLowerCase();
-          const existente = clientes.find((c) => c.nombre.toLowerCase() === key);
-          if (existente) {
-            clienteId = existente.id;
-          } else if (clientesNuevos[key]) {
-            clienteId = clientesNuevos[key];
-          } else {
-            const nuevoId = uid();
-            const ok = await createItem("clientes", { id: nuevoId, nombre: item.clienteNombre }, setClientes, clientes);
-            if (ok) { clienteId = nuevoId; clientesNuevos[key] = nuevoId; hechos.push(`Cliente nuevo: ${item.clienteNombre}`); }
-          }
-        }
-
-        const campos = { ...item.campos };
-
-        if (item.entidad === "tarea") {
-          if (item.accion === "actualizar" && item.targetId) {
-            const ok = await updateItem("tareas", item.targetId, campos, setTareas, tareas);
-            if (ok) hechos.push(resumenAccion(item));
-          } else {
-            const ok = await createItem("tareas", { id: uid(), estado: "Pendiente", area: "Profesional", prioridad: "Media", clienteId, ...campos }, setTareas, tareas);
-            if (ok) hechos.push(resumenAccion(item));
-          }
-        } else if (item.entidad === "cobro") {
-          const ok = await createItem("cobros", { id: uid(), estado: "Pendiente", clienteId, ...campos }, setCobros, /* list no usado */ []);
-          if (ok) hechos.push(resumenAccion(item));
-        } else if (item.entidad === "agenda") {
-          const ok = await createItem("agenda", { id: uid(), tipo: "Reunión", area: "Profesional", clienteId, ...campos }, setAgenda, []);
-          if (ok) hechos.push(resumenAccion(item));
-        } else if (item.entidad === "documento") {
-          if (item.accion === "actualizar" && item.targetId) {
-            const ok = await updateItem("documentos_pendientes", item.targetId, campos, setDocumentos, documentos);
-            if (ok) hechos.push(resumenAccion(item));
-          } else {
-            const ok = await createItem("documentos_pendientes", { id: uid(), clienteId, estado: "Solicitado", ...campos }, setDocumentos, documentos);
-            if (ok) hechos.push(resumenAccion(item));
-          }
-        }
+      if (pregunta) {
+        await createItem("mensajes_nota", { id: uid(), notaId, rol: "sistema", contenido: pregunta }, setMensajes, mensajes);
+        await updateItem("notas_rapidas", notaId, { estado: "Necesita aclaración", resumen: resumenTexto }, setNotas, notas);
+      } else {
+        await updateItem("notas_rapidas", notaId, { estado: "Completada", procesada: true, resumen: resumenTexto }, setNotas, notas);
       }
-
-      // Marcar la nota como procesada y guardar el resumen de lo que se hizo — auditable después.
-      const resumenTexto = [...hechos, ...preguntas.map((p) => `Por aclarar: ${p}`)].join(" · ") || "Sin acciones detectadas.";
-      await updateItem("notas_rapidas", notaId, { procesada: hechos.length > 0, resumen: resumenTexto }, setNotas, notas);
-
-      setResultado({ hechos, preguntas });
-      if (hechos.length > 0 || preguntas.length === 0) setTexto("");
+      setTexto("");
     } catch (e) {
       setErrorIA(e?.message || "No se pudo conectar con el servidor.");
     } finally {
@@ -1350,33 +1657,99 @@ function NotaRapidaView({ notas, clientes, tareas, documentos, clienteNombre, cr
     }
   };
 
+  /** Continúa el chat de aclaración de una nota existente — nunca crea una nota nueva. */
+  const responderEnNota = async (notaId, textoRespuesta) => {
+    const nota = notas.find((n) => n.id === notaId);
+    if (!nota) return;
+
+    const okMsg = await createItem("mensajes_nota", { id: uid(), notaId, rol: "carolina", contenido: textoRespuesta }, setMensajes, mensajes);
+    if (!okMsg) return;
+
+    const historialChat = mensajes
+      .filter((m) => m.notaId === notaId)
+      .concat([{ notaId, rol: "carolina", contenido: textoRespuesta }])
+      .sort((a, b) => (a.createdAt || "").localeCompare(b.createdAt || ""))
+      .map((m) => ({ rol: m.rol, contenido: m.contenido }));
+
+    try {
+      const res = await fetch("/api/parse-nota", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ texto: nota.texto, contexto: contextoActual(), historialChat }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        await createItem("mensajes_nota", { id: uid(), notaId, rol: "sistema", contenido: `No pude procesar tu respuesta: ${data?.error || "error desconocido"}.` }, setMensajes, mensajes);
+        return;
+      }
+
+      const { hechos, pregunta } = await ejecutarAcciones(data.acciones || []);
+      const resumenPrevio = nota.resumen || "";
+      const resumenNuevo = [resumenPrevio, ...hechos].filter(Boolean).join(" · ");
+
+      if (pregunta) {
+        await createItem("mensajes_nota", { id: uid(), notaId, rol: "sistema", contenido: pregunta }, setMensajes, mensajes);
+        await updateItem("notas_rapidas", notaId, { resumen: resumenNuevo }, setNotas, notas);
+      } else {
+        const cierre = hechos.length ? `Listo. ${hechos.join(" · ")}.` : "Listo, quedó organizado.";
+        await createItem("mensajes_nota", { id: uid(), notaId, rol: "sistema", contenido: cierre }, setMensajes, mensajes);
+        await updateItem("notas_rapidas", notaId, { estado: "Completada", procesada: true, resumen: resumenNuevo }, setNotas, notas);
+      }
+    } catch (e) {
+      await createItem("mensajes_nota", { id: uid(), notaId, rol: "sistema", contenido: "No pude conectarme para procesar tu respuesta. Intenta de nuevo." }, setMensajes, mensajes);
+    }
+  };
+
+  const notasVisibles = notas.filter((n) => n.estado !== "Archivada");
+
   return (
     <div>
-      <SectionTitle sub="Escribe lo que tienes en mente, tal como lo piensas. Caro Control lo ejecuta directo: crea o actualiza lo que corresponda. Si algo no queda claro, te lo pregunta en vez de inventarlo.">
+      <SectionTitle sub="Escribe lo que tienes en mente, tal como lo piensas. Caro Control ejecuta lo que pueda y solo abre una pregunta, aquí mismo en la nota, cuando de verdad hace falta.">
         ¿Qué tienes en mente?
       </SectionTitle>
+
+      <PreferenciasPanel perfil={perfil} guardarPerfil={guardarPerfil} />
 
       <Card className="p-4 mb-6">
         <textarea
           value={texto}
-          onChange={(e) => { setTexto(e.target.value); setResultado(null); setErrorIA(""); }}
+          onChange={(e) => { setTexto(e.target.value); setErrorIA(""); }}
           onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) enviar(); }}
           rows={4}
-          placeholder='Ej. "Hoy Pedro me mandó los extractos. Tengo que revisar la contabilidad y cobrarle 900 mil. Quedamos de vernos el jueves."'
+          placeholder='Ej. "Pedro bancos" o "Hoy Pedro me mandó los extractos, cobrarle 900 mil el viernes"'
           className={inputCls}
           style={inputStyle}
         />
+
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.csv,.txt"
+          className="hidden"
+          onChange={(e) => { if (e.target.files?.length) agregarArchivos(e.target.files); e.target.value = ""; }}
+        />
+
+        {archivosSeleccionados.length > 0 && (
+          <div className="flex flex-wrap gap-2 mt-3">
+            {archivosSeleccionados.map((f, i) => (
+              <span key={i} className="inline-flex items-center gap-1.5 pl-2.5 pr-1.5 py-1 rounded-full text-xs" style={{ background: "#F5F1EE", color: "#6B6570" }}>
+                {f.name} <span style={{ color: "#B0A99A" }}>({fmtBytes(f.size)})</span>
+                <button onClick={() => quitarSeleccionado(i)} className="p-0.5 rounded-full hover:bg-white"><X size={11} /></button>
+              </span>
+            ))}
+          </div>
+        )}
+
         <div className="flex flex-wrap items-center gap-2 mt-3">
-          <button
-            onClick={enviar}
-            disabled={!texto.trim() || procesando}
-            className="flex items-center gap-1.5 text-sm font-medium px-4 py-2 rounded-lg text-white disabled:opacity-40"
-            style={{ background: "#7A2E4A" }}
-          >
+          <button onClick={enviar} disabled={(!texto.trim() && archivosSeleccionados.length === 0) || procesando} className="flex items-center gap-1.5 text-sm font-medium px-4 py-2 rounded-lg text-white disabled:opacity-40" style={{ background: "#7A2E4A" }}>
             {procesando ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
             {procesando ? "Procesando…" : "Enviar"}
           </button>
-          <button onClick={guardarSinProcesar} disabled={!texto.trim() || procesando} className="text-sm font-medium px-3 py-2" style={{ color: "#6B6570" }}>
+          <button onClick={() => fileInputRef.current?.click()} className="flex items-center gap-1.5 text-sm font-medium px-3 py-2 rounded-lg" style={{ color: "#7A2E4A", border: "1px solid #7A2E4A" }}>
+            <Plus size={14} /> Adjuntar
+          </button>
+          <button onClick={guardarSinProcesar} disabled={(!texto.trim() && archivosSeleccionados.length === 0) || procesando} className="text-sm font-medium px-3 py-2" style={{ color: "#6B6570" }}>
             Solo guardar
           </button>
           <button onClick={copiarPrompt} disabled={!texto.trim()} className="text-xs px-2 py-1 ml-auto disabled:opacity-40" style={{ color: "#B0A99A" }}>
@@ -1390,69 +1763,29 @@ function NotaRapidaView({ notas, clientes, tareas, documentos, clienteNombre, cr
         )}
       </Card>
 
-      {resultado && (
-        <Card className="p-4 mb-6">
-          {resultado.hechos.length > 0 && (
-            <>
-              <p className="text-xs font-semibold uppercase tracking-wide mb-2" style={{ color: "#4B7B62" }}>Listo</p>
-              <ul className="space-y-1.5 mb-3">
-                {resultado.hechos.map((h, i) => (
-                  <li key={i} className="text-sm flex items-start gap-2" style={{ color: "#2B2440" }}>
-                    <Check size={14} className="flex-shrink-0 mt-0.5" style={{ color: "#4B7B62" }} /> {h}
-                  </li>
-                ))}
-              </ul>
-            </>
-          )}
-          {resultado.preguntas.length > 0 && (
-            <>
-              <p className="text-xs font-semibold uppercase tracking-wide mb-2 mt-2" style={{ color: "#8B2E3F" }}>Por aclarar</p>
-              <ul className="space-y-1.5">
-                {resultado.preguntas.map((p, i) => (
-                  <li key={i} className="text-sm flex items-start gap-2" style={{ color: "#2B2440" }}>
-                    <AlertTriangle size={14} className="flex-shrink-0 mt-0.5" style={{ color: "#8B2E3F" }} /> {p}
-                  </li>
-                ))}
-              </ul>
-            </>
-          )}
-          {resultado.hechos.length === 0 && resultado.preguntas.length === 0 && (
-            <p className="text-sm" style={{ color: "#8A8398" }}>No detecté ninguna acción concreta en esa nota.</p>
-          )}
-        </Card>
-      )}
-
-      {notas.length === 0 ? (
+      {notasVisibles.length === 0 ? (
         <EmptyState icon={PenLine} text="Tu historial de notas aparecerá aquí." />
       ) : (
         <div className="space-y-2">
-          {notas.map((n) => (
-            <Card key={n.id} className="p-4">
-              <p className="text-sm" style={{ color: "#2B2440" }}>{n.texto}</p>
-              {n.resumen && <p className="text-xs mt-1.5" style={{ color: "#8A8398" }}>{n.resumen}</p>}
-              <div className="flex items-center justify-between mt-3">
-                <span className="text-[11px]" style={{ color: "#B0A99A" }}>
-                  {new Date(n.createdAt).toLocaleString("es-CO", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}
-                </span>
-                <div className="flex items-center gap-3">
-                  {n.procesada ? (
-                    <Stamp color="#4B7B62"><Check size={11} className="inline -mt-0.5" /> Procesada</Stamp>
-                  ) : (
-                    <button onClick={() => updateItem("notas_rapidas", n.id, { procesada: true }, setNotas, notas)} className="text-xs font-medium" style={{ color: "#7A2E4A" }}>
-                      Marcar procesada
-                    </button>
-                  )}
-                  <button onClick={() => deleteItem("notas_rapidas", n.id, setNotas, notas)}><Trash2 size={13} style={{ color: "#B0A99A" }} /></button>
-                </div>
-              </div>
-            </Card>
+          {notasVisibles.map((n) => (
+            <NotaCard
+              key={n.id}
+              nota={n}
+              mensajesDeNota={mensajes.filter((m) => m.notaId === n.id).sort((a, b) => (a.createdAt || "").localeCompare(b.createdAt || ""))}
+              adjuntosDeNota={archivos.filter((a) => a.notaId === n.id)}
+              onResponder={responderEnNota}
+              onMarcarProcesada={(id) => updateItem("notas_rapidas", id, { estado: "Completada", procesada: true }, setNotas, notas)}
+              onArchivar={(id) => updateItem("notas_rapidas", id, { estado: "Archivada" }, setNotas, notas)}
+              onEliminar={(id) => deleteItem("notas_rapidas", id, setNotas, notas)}
+              onVerArchivo={verArchivo}
+              onEliminarArchivo={eliminarArchivo}
+            />
           ))}
         </div>
       )}
     </div>
   );
 }
-
 
 /* ============================================================
    Búsqueda global
