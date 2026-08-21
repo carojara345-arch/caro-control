@@ -263,6 +263,7 @@ export default function CaroControl() {
   const [cobros, setCobros] = useState([]);
   const [agenda, setAgenda] = useState([]);
   const [notas, setNotas] = useState([]);
+  const [documentos, setDocumentos] = useState([]);
   const [modal, setModal] = useState(null); // {type, data?}
   const [search, setSearch] = useState("");
   const [saving, setSaving] = useState(false);
@@ -303,9 +304,9 @@ export default function CaroControl() {
       setLoading(true);
       const token = await getValidToken();
       if (!token) { setLoading(false); return; }
-      const [c, t, co, ag, no] = await Promise.all([
+      const [c, t, co, ag, no, doc] = await Promise.all([
         fetchTable("clientes", token), fetchTable("tareas", token), fetchTable("cobros", token),
-        fetchTable("agenda", token), fetchTable("notas_rapidas", token),
+        fetchTable("agenda", token), fetchTable("notas_rapidas", token), fetchTable("documentos_pendientes", token),
       ]);
       let hadError = false;
       if (c.ok) setClientes(c.data); else { hadError = true; }
@@ -313,6 +314,7 @@ export default function CaroControl() {
       if (co.ok) setCobros(co.data); else { hadError = true; }
       if (ag.ok) setAgenda(ag.data); else { hadError = true; }
       if (no.ok) setNotas(no.data); else { hadError = true; }
+      if (doc.ok) setDocumentos(doc.data); else { hadError = true; }
       setLoading(false);
       if (hadError) showToast("error", "Algunos datos no se pudieron cargar desde Supabase. Revisa tu conexión.");
     })();
@@ -465,7 +467,7 @@ export default function CaroControl() {
             {saving && (<><Loader2 size={13} className="animate-spin" /> <span className="hidden sm:inline">Guardando…</span></>)}
           </div>
           <button
-            onClick={() => { setSession(null); setClientes([]); setTareas([]); setCobros([]); setAgenda([]); setNotas([]); }}
+            onClick={() => { setSession(null); setClientes([]); setTareas([]); setCobros([]); setAgenda([]); setNotas([]); setDocumentos([]); }}
             className="hidden sm:inline text-xs font-medium px-2 py-1 rounded-md"
             style={{ color: "#8A8398" }}
             title={session.email}
@@ -550,15 +552,18 @@ export default function CaroControl() {
               <NotaRapidaView
                 notas={notas}
                 clientes={clientes}
-                onGuardar={(texto) => createItem("notas_rapidas", { id: uid(), texto, procesada: false }, setNotas, notas)}
-                onMarcarProcesada={(id) => {
-                  const n = notas.find((x) => x.id === id);
-                  if (n) updateItem("notas_rapidas", id, { ...n, procesada: true }, setNotas, notas);
-                }}
-                onEliminar={(id) => deleteItem("notas_rapidas", id, setNotas, notas)}
-                onCrearTarea={(campos) => createItem("tareas", { id: uid(), estado: "Pendiente", area: "Profesional", prioridad: "Media", ...campos }, setTareas, tareas)}
-                onCrearCobro={(campos) => createItem("cobros", { id: uid(), estado: "Pendiente", ...campos }, setCobros, cobros)}
-                onCrearAgenda={(campos) => createItem("agenda", { id: uid(), tipo: "Reunión", area: "Profesional", ...campos }, setAgenda, agenda)}
+                tareas={tareas}
+                documentos={documentos}
+                clienteNombre={clienteNombre}
+                createItem={createItem}
+                updateItem={updateItem}
+                deleteItem={deleteItem}
+                setClientes={setClientes}
+                setTareas={setTareas}
+                setCobros={setCobros}
+                setAgenda={setAgenda}
+                setNotas={setNotas}
+                setDocumentos={setDocumentos}
               />
             )}
           </>
@@ -1203,8 +1208,10 @@ function AgendaModal({ data, clientes, onClose, onSave, onDelete }) {
 }
 
 /* ============================================================
-   Nota rápida — procesamiento automático vía Claude (API propia,
-   server-side) con vista previa: nada se crea sin que la confirmes.
+   Nota rápida — motor de lenguaje natural con ejecución directa.
+   Escribes, se procesa y se guarda de una vez (crear o actualizar
+   según corresponda). Si algo es ambiguo, no se inventa: queda
+   como pregunta pendiente en vez de convertirse en una acción.
    ============================================================ */
 
 const PROMPT_BASE = `Convierte la siguiente nota en elementos organizados. Para cada elemento identifica el tipo (TAREA, CLIENTE, DOCUMENTO, COBRO, AGENDA) y sus datos. Si falta información esencial, no la inventes: márcalo como "PENDIENTE POR ACLARAR" con la pregunta correspondiente.
@@ -1212,16 +1219,28 @@ const PROMPT_BASE = `Convierte la siguiente nota en elementos organizados. Para 
 Nota:
 "`;
 
-const TIPO_LABEL = { tarea: "Tarea", cobro: "Cobro", agenda: "Agenda", pendiente_aclarar: "Por aclarar" };
-const TIPO_COLOR = { tarea: "#7A2E4A", cobro: "#B08D57", agenda: "#54506A", pendiente_aclarar: "#8B2E3F" };
+const ENTIDAD_LABEL = { tarea: "Tarea", cobro: "Cobro", agenda: "Agenda", documento: "Documento", cliente: "Cliente" };
+const ENTIDAD_COLOR = { tarea: "#7A2E4A", cobro: "#B08D57", agenda: "#54506A", documento: "#4B7B62", cliente: "#8B2E3F" };
 
-function NotaRapidaView({ notas, clientes, onGuardar, onMarcarProcesada, onEliminar, onCrearTarea, onCrearCobro, onCrearAgenda }) {
+function resumenAccion(item) {
+  const { entidad, accion, campos } = item;
+  const nombre = campos.titulo || campos.concepto || campos.nombreDocumento || "";
+  const verbo = accion === "actualizar" ? "Actualizada" : "Creada";
+  let extra = "";
+  if (campos.valor) extra += ` — ${fmtCOP(campos.valor)}`;
+  const fecha = campos.fechaLimite || campos.fechaEsperada || campos.fecha || campos.fechaRecibido;
+  if (fecha) extra += ` · ${fmtDate(fecha)}`;
+  if (entidad === "tarea" && accion === "actualizar") return `Tarea marcada como ${(campos.estado || "actualizada").toLowerCase()}: ${nombre || "—"}`;
+  if (entidad === "documento" && accion === "actualizar") return `Documento actualizado (${campos.estado || "—"}): ${nombre || "—"}`;
+  return `${ENTIDAD_LABEL[entidad] || entidad} ${verbo.toLowerCase()}: ${nombre}${extra}`;
+}
+
+function NotaRapidaView({ notas, clientes, tareas, documentos, clienteNombre, createItem, updateItem, deleteItem, setClientes, setTareas, setCobros, setAgenda, setNotas, setDocumentos }) {
   const [texto, setTexto] = useState("");
   const [copiado, setCopiado] = useState(false);
   const [procesando, setProcesando] = useState(false);
   const [errorIA, setErrorIA] = useState("");
-  const [preview, setPreview] = useState(null); // array de {tipo, clienteNombre, campos, pregunta, incluir}
-  const [creando, setCreando] = useState(false);
+  const [resultado, setResultado] = useState(null); // { hechos: [], preguntas: [] }
 
   const copiarPrompt = () => {
     const promptCompleto = PROMPT_BASE + texto + '"';
@@ -1230,20 +1249,100 @@ function NotaRapidaView({ notas, clientes, onGuardar, onMarcarProcesada, onElimi
     setTimeout(() => setCopiado(false), 1500);
   };
 
-  const procesarConIA = async () => {
+  const guardarSinProcesar = async () => {
     if (!texto.trim()) return;
-    setProcesando(true); setErrorIA(""); setPreview(null);
+    const ok = await createItem("notas_rapidas", { id: uid(), texto: texto.trim(), procesada: false }, setNotas, notas);
+    if (ok) setTexto("");
+  };
+
+  const enviar = async () => {
+    if (!texto.trim() || procesando) return;
+    const textoNota = texto.trim();
+    setProcesando(true); setErrorIA(""); setResultado(null);
+
+    // Paso 1: guardar la nota original de una vez — historial real, pase lo que pase después.
+    const notaId = uid();
+    await createItem("notas_rapidas", { id: notaId, texto: textoNota, procesada: false }, setNotas, notas);
+
     try {
+      const tareasAbiertas = tareas
+        .filter((t) => !["Completada", "Cancelada"].includes(t.estado))
+        .map((t) => ({ id: t.id, titulo: t.titulo, clienteNombre: clienteNombre(t.clienteId) }));
+      const documentosPendientes = documentos
+        .filter((d) => d.estado !== "Revisado")
+        .map((d) => ({ id: d.id, nombre: d.nombreDocumento, estado: d.estado, clienteNombre: clienteNombre(d.clienteId) }));
+
       const res = await fetch("/api/parse-nota", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ texto: texto.trim(), clientes: clientes.map((c) => ({ nombre: c.nombre })) }),
+        body: JSON.stringify({
+          texto: textoNota,
+          contexto: { clientes: clientes.map((c) => ({ id: c.id, nombre: c.nombre })), tareasAbiertas, documentosPendientes },
+        }),
       });
       const data = await res.json();
       if (!res.ok) { setErrorIA(data?.error || "No se pudo procesar la nota."); return; }
-      const items = (data.items || []).map((it) => ({ ...it, incluir: it.tipo !== "pendiente_aclarar" }));
-      if (items.length === 0) setErrorIA("No se detectó nada accionable en la nota.");
-      setPreview(items);
+
+      const acciones = data.acciones || [];
+      const hechos = [];
+      const preguntas = [];
+      const clientesNuevos = {}; // nombre en minúscula -> id, para no crear el mismo cliente dos veces en la misma nota
+
+      for (const item of acciones) {
+        if (item.entidad === "pendiente_aclarar") {
+          if (item.pregunta) preguntas.push(item.pregunta);
+          continue;
+        }
+
+        // Resolver cliente: usar el existente, el recién creado en esta misma nota, o crear uno mínimo.
+        let clienteId = null;
+        if (item.clienteNombre) {
+          const key = item.clienteNombre.toLowerCase();
+          const existente = clientes.find((c) => c.nombre.toLowerCase() === key);
+          if (existente) {
+            clienteId = existente.id;
+          } else if (clientesNuevos[key]) {
+            clienteId = clientesNuevos[key];
+          } else {
+            const nuevoId = uid();
+            const ok = await createItem("clientes", { id: nuevoId, nombre: item.clienteNombre }, setClientes, clientes);
+            if (ok) { clienteId = nuevoId; clientesNuevos[key] = nuevoId; hechos.push(`Cliente nuevo: ${item.clienteNombre}`); }
+          }
+        }
+
+        const campos = { ...item.campos };
+
+        if (item.entidad === "tarea") {
+          if (item.accion === "actualizar" && item.targetId) {
+            const ok = await updateItem("tareas", item.targetId, campos, setTareas, tareas);
+            if (ok) hechos.push(resumenAccion(item));
+          } else {
+            const ok = await createItem("tareas", { id: uid(), estado: "Pendiente", area: "Profesional", prioridad: "Media", clienteId, ...campos }, setTareas, tareas);
+            if (ok) hechos.push(resumenAccion(item));
+          }
+        } else if (item.entidad === "cobro") {
+          const ok = await createItem("cobros", { id: uid(), estado: "Pendiente", clienteId, ...campos }, setCobros, /* list no usado */ []);
+          if (ok) hechos.push(resumenAccion(item));
+        } else if (item.entidad === "agenda") {
+          const ok = await createItem("agenda", { id: uid(), tipo: "Reunión", area: "Profesional", clienteId, ...campos }, setAgenda, []);
+          if (ok) hechos.push(resumenAccion(item));
+        } else if (item.entidad === "documento") {
+          if (item.accion === "actualizar" && item.targetId) {
+            const ok = await updateItem("documentos_pendientes", item.targetId, campos, setDocumentos, documentos);
+            if (ok) hechos.push(resumenAccion(item));
+          } else {
+            const ok = await createItem("documentos_pendientes", { id: uid(), clienteId, estado: "Solicitado", ...campos }, setDocumentos, documentos);
+            if (ok) hechos.push(resumenAccion(item));
+          }
+        }
+      }
+
+      // Marcar la nota como procesada y guardar el resumen de lo que se hizo — auditable después.
+      const resumenTexto = [...hechos, ...preguntas.map((p) => `Por aclarar: ${p}`)].join(" · ") || "Sin acciones detectadas.";
+      await updateItem("notas_rapidas", notaId, { procesada: hechos.length > 0, resumen: resumenTexto }, setNotas, notas);
+
+      setResultado({ hechos, preguntas });
+      if (hechos.length > 0 || preguntas.length === 0) setTexto("");
     } catch (e) {
       setErrorIA(e?.message || "No se pudo conectar con el servidor.");
     } finally {
@@ -1251,38 +1350,17 @@ function NotaRapidaView({ notas, clientes, onGuardar, onMarcarProcesada, onElimi
     }
   };
 
-  const resolverClienteId = (nombre) => {
-    if (!nombre) return null;
-    const c = clientes.find((c) => c.nombre.toLowerCase() === nombre.toLowerCase());
-    return c ? c.id : null;
-  };
-
-  const crearSeleccionados = async () => {
-    if (!preview) return;
-    setCreando(true);
-    for (const item of preview) {
-      if (!item.incluir || item.tipo === "pendiente_aclarar") continue;
-      const clienteId = resolverClienteId(item.clienteNombre);
-      const campos = { ...item.campos, clienteId };
-      if (item.tipo === "tarea") await onCrearTarea(campos);
-      else if (item.tipo === "cobro") await onCrearCobro(campos);
-      else if (item.tipo === "agenda") await onCrearAgenda(campos);
-    }
-    setCreando(false);
-    setPreview(null);
-    setTexto("");
-  };
-
   return (
     <div>
-      <SectionTitle sub="Escribe tu nota tal como la piensas. Claude la lee y te propone tareas, cobros o citas — tú confirmas antes de que se cree nada. Si algo no queda claro, aparece como pendiente por aclarar en vez de inventarse.">
-        Nota rápida
+      <SectionTitle sub="Escribe lo que tienes en mente, tal como lo piensas. Caro Control lo ejecuta directo: crea o actualiza lo que corresponda. Si algo no queda claro, te lo pregunta en vez de inventarlo.">
+        ¿Qué tienes en mente?
       </SectionTitle>
 
       <Card className="p-4 mb-6">
         <textarea
           value={texto}
-          onChange={(e) => { setTexto(e.target.value); setPreview(null); setErrorIA(""); }}
+          onChange={(e) => { setTexto(e.target.value); setResultado(null); setErrorIA(""); }}
+          onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) enviar(); }}
           rows={4}
           placeholder='Ej. "Hoy Pedro me mandó los extractos. Tengo que revisar la contabilidad y cobrarle 900 mil. Quedamos de vernos el jueves."'
           className={inputCls}
@@ -1290,99 +1368,68 @@ function NotaRapidaView({ notas, clientes, onGuardar, onMarcarProcesada, onElimi
         />
         <div className="flex flex-wrap items-center gap-2 mt-3">
           <button
-            onClick={procesarConIA}
+            onClick={enviar}
             disabled={!texto.trim() || procesando}
-            className="flex items-center gap-1.5 text-sm font-medium px-3.5 py-2 rounded-lg text-white disabled:opacity-40"
+            className="flex items-center gap-1.5 text-sm font-medium px-4 py-2 rounded-lg text-white disabled:opacity-40"
             style={{ background: "#7A2E4A" }}
           >
             {procesando ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
-            {procesando ? "Procesando…" : "Procesar con IA"}
+            {procesando ? "Procesando…" : "Enviar"}
           </button>
-          <button
-            onClick={copiarPrompt}
-            disabled={!texto.trim()}
-            className="flex items-center gap-1.5 text-sm font-medium px-3.5 py-2 rounded-lg disabled:opacity-40"
-            style={{ color: "#7A2E4A", border: "1px solid #7A2E4A" }}
-          >
-            {copiado ? "Prompt copiado" : "Copiar prompt manual"}
-          </button>
-          <button
-            onClick={async () => { if (texto.trim()) { const ok = await onGuardar(texto.trim()); if (ok) setTexto(""); } }}
-            disabled={!texto.trim()}
-            className="text-sm font-medium px-3.5 py-2 rounded-lg"
-            style={{ color: "#6B6570" }}
-          >
+          <button onClick={guardarSinProcesar} disabled={!texto.trim() || procesando} className="text-sm font-medium px-3 py-2" style={{ color: "#6B6570" }}>
             Solo guardar
+          </button>
+          <button onClick={copiarPrompt} disabled={!texto.trim()} className="text-xs px-2 py-1 ml-auto disabled:opacity-40" style={{ color: "#B0A99A" }}>
+            {copiado ? "Copiado" : "¿Falla la IA? copiar prompt manual"}
           </button>
         </div>
         {errorIA && (
           <div className="flex items-start gap-2 mt-3 text-xs px-3 py-2 rounded-lg" style={{ background: "#8B2E3F0d", color: "#8B2E3F", border: "1px solid #8B2E3F33" }}>
-            <AlertTriangle size={14} className="flex-shrink-0 mt-0.5" /> {errorIA}
+            <AlertTriangle size={14} className="flex-shrink-0 mt-0.5" /> {errorIA} — la nota ya quedó guardada en tu historial de abajo, sin procesar.
           </div>
         )}
       </Card>
 
-      {preview && (
+      {resultado && (
         <Card className="p-4 mb-6">
-          <p className="text-xs font-semibold uppercase tracking-wide mb-3" style={{ color: "#6B6570" }}>
-            Esto detectó — revisa y confirma
-          </p>
-          <div className="space-y-2">
-            {preview.map((item, i) => (
-              <div key={i} className="flex items-start gap-3 px-3 py-2.5 rounded-lg border" style={{ borderColor: "#E7E1D8" }}>
-                {item.tipo !== "pendiente_aclarar" ? (
-                  <input
-                    type="checkbox"
-                    checked={item.incluir}
-                    onChange={(e) => setPreview(preview.map((p, j) => (j === i ? { ...p, incluir: e.target.checked } : p)))}
-                    className="mt-1 flex-shrink-0"
-                  />
-                ) : (
-                  <AlertTriangle size={15} className="flex-shrink-0 mt-0.5" style={{ color: TIPO_COLOR.pendiente_aclarar }} />
-                )}
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 mb-0.5">
-                    <Stamp color={TIPO_COLOR[item.tipo]}>{TIPO_LABEL[item.tipo]}</Stamp>
-                    {item.clienteNombre && <span className="text-xs" style={{ color: "#8A8398" }}>{item.clienteNombre}</span>}
-                  </div>
-                  {item.tipo === "pendiente_aclarar" ? (
-                    <p className="text-sm" style={{ color: "#2B2440" }}>{item.pregunta}</p>
-                  ) : (
-                    <p className="text-sm" style={{ color: "#2B2440" }}>
-                      {item.campos.titulo || item.campos.concepto}
-                      {item.campos.valor ? ` — ${fmtCOP(item.campos.valor)}` : ""}
-                      {(item.campos.fechaLimite || item.campos.fechaEsperada || item.campos.fecha) &&
-                        ` · ${fmtDate(item.campos.fechaLimite || item.campos.fechaEsperada || item.campos.fecha)}`}
-                    </p>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-          <div className="flex items-center gap-2 mt-4">
-            <button
-              onClick={crearSeleccionados}
-              disabled={creando || !preview.some((p) => p.incluir)}
-              className="flex items-center gap-1.5 text-sm font-medium px-3.5 py-2 rounded-lg text-white disabled:opacity-40"
-              style={{ background: "#7A2E4A" }}
-            >
-              {creando && <Loader2 size={14} className="animate-spin" />}
-              Crear seleccionados
-            </button>
-            <button onClick={() => setPreview(null)} className="text-sm font-medium px-3.5 py-2" style={{ color: "#8A8398" }}>
-              Descartar
-            </button>
-          </div>
+          {resultado.hechos.length > 0 && (
+            <>
+              <p className="text-xs font-semibold uppercase tracking-wide mb-2" style={{ color: "#4B7B62" }}>Listo</p>
+              <ul className="space-y-1.5 mb-3">
+                {resultado.hechos.map((h, i) => (
+                  <li key={i} className="text-sm flex items-start gap-2" style={{ color: "#2B2440" }}>
+                    <Check size={14} className="flex-shrink-0 mt-0.5" style={{ color: "#4B7B62" }} /> {h}
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+          {resultado.preguntas.length > 0 && (
+            <>
+              <p className="text-xs font-semibold uppercase tracking-wide mb-2 mt-2" style={{ color: "#8B2E3F" }}>Por aclarar</p>
+              <ul className="space-y-1.5">
+                {resultado.preguntas.map((p, i) => (
+                  <li key={i} className="text-sm flex items-start gap-2" style={{ color: "#2B2440" }}>
+                    <AlertTriangle size={14} className="flex-shrink-0 mt-0.5" style={{ color: "#8B2E3F" }} /> {p}
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+          {resultado.hechos.length === 0 && resultado.preguntas.length === 0 && (
+            <p className="text-sm" style={{ color: "#8A8398" }}>No detecté ninguna acción concreta en esa nota.</p>
+          )}
         </Card>
       )}
 
       {notas.length === 0 ? (
-        <EmptyState icon={PenLine} text="Tus notas guardadas manualmente aparecerán aquí." />
+        <EmptyState icon={PenLine} text="Tu historial de notas aparecerá aquí." />
       ) : (
         <div className="space-y-2">
           {notas.map((n) => (
             <Card key={n.id} className="p-4">
               <p className="text-sm" style={{ color: "#2B2440" }}>{n.texto}</p>
+              {n.resumen && <p className="text-xs mt-1.5" style={{ color: "#8A8398" }}>{n.resumen}</p>}
               <div className="flex items-center justify-between mt-3">
                 <span className="text-[11px]" style={{ color: "#B0A99A" }}>
                   {new Date(n.createdAt).toLocaleString("es-CO", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}
@@ -1391,11 +1438,11 @@ function NotaRapidaView({ notas, clientes, onGuardar, onMarcarProcesada, onElimi
                   {n.procesada ? (
                     <Stamp color="#4B7B62"><Check size={11} className="inline -mt-0.5" /> Procesada</Stamp>
                   ) : (
-                    <button onClick={() => onMarcarProcesada(n.id)} className="text-xs font-medium" style={{ color: "#7A2E4A" }}>
+                    <button onClick={() => updateItem("notas_rapidas", n.id, { procesada: true }, setNotas, notas)} className="text-xs font-medium" style={{ color: "#7A2E4A" }}>
                       Marcar procesada
                     </button>
                   )}
-                  <button onClick={() => onEliminar(n.id)}><Trash2 size={13} style={{ color: "#B0A99A" }} /></button>
+                  <button onClick={() => deleteItem("notas_rapidas", n.id, setNotas, notas)}><Trash2 size={13} style={{ color: "#B0A99A" }} /></button>
                 </div>
               </div>
             </Card>
@@ -1405,6 +1452,7 @@ function NotaRapidaView({ notas, clientes, onGuardar, onMarcarProcesada, onElimi
     </div>
   );
 }
+
 
 /* ============================================================
    Búsqueda global
